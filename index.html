@@ -133,6 +133,10 @@ button{font-family:inherit;cursor:pointer;}
 .settings-row .st{font-size:13px;font-weight:600;}
 .settings-row small{display:block;color:var(--muted);font-weight:400;font-size:11px;margin-top:2px;}
 
+.code-box{background:var(--navy-50);border:1.5px dashed var(--navy-600);border-radius:16px;padding:20px;text-align:center;}
+.code-box .cl{font-size:11.5px;color:var(--muted);margin:0 0 8px;text-transform:uppercase;letter-spacing:.6px;font-weight:700;}
+.code-box .cv{font-family:'Manrope';font-weight:800;font-size:26px;letter-spacing:6px;margin:0;}
+
 @media (max-width:980px){
   .sidebar{width:76px;}
   .sb-brand .txt,.sb-school,.sb-link span{display:none;}
@@ -144,14 +148,11 @@ button{font-family:inherit;cursor:pointer;}
 </head>
 <body>
 <div id="gate">
-  <div class="gate-card">
+  <div class="gate-card" id="gate-card">
     <div class="mark">H</div>
     <h1>HUMA BANK — Administration</h1>
     <p>Centre de contrôle des comptes de l'établissement</p>
-    <input id="gate-pass" type="password" placeholder="Mot de passe administrateur">
-    <div id="gate-err" class="gate-err" style="display:none;">Mot de passe incorrect.</div>
-    <button onclick="gateLogin()">Accéder au dashboard</button>
-    <div class="gate-hint">Démo : mot de passe <b>admin123</b><br>Ce dashboard est un prototype autonome. Une synchronisation en temps réel avec l'app "index" nécessitera un backend partagé (API + base de données communes).</div>
+    <div id="gate-body">Chargement…</div>
   </div>
 </div>
 <div id="app"></div>
@@ -207,6 +208,7 @@ const ACCOUNTS = {};
 const RECHARGE_REQUESTS = [];
 const WITHDRAW_REQUESTS = [];
 const SECURITY_LOG = [];
+const PARENT_PENDING = [];
 
 function todayStr2(d){
   const days = Math.floor((Date.now()-d.getTime())/86400000);
@@ -215,7 +217,7 @@ function todayStr2(d){
   return d.toLocaleDateString('fr-FR');
 }
 async function loadFromSupabase(){
-  const [accRes, cardRes, txRes, notifRes, rcRes, wdRes, secRes, setRes] = await Promise.all([
+  const [accRes, cardRes, txRes, notifRes, rcRes, wdRes, secRes, setRes, ppRes] = await Promise.all([
     sb.from('accounts').select('*'),
     sb.from('cards').select('*'),
     sb.from('transactions').select('*').order('created_at',{ascending:false}),
@@ -224,7 +226,15 @@ async function loadFromSupabase(){
     sb.from('withdraw_requests').select('*').order('created_at',{ascending:false}),
     sb.from('security_log').select('*').order('created_at',{ascending:false}).limit(50),
     sb.from('app_settings').select('*').eq('key','school').maybeSingle(),
+    sb.from('parent_pending').select('*').order('created_at',{ascending:false}),
   ]);
+  PARENT_PENDING.length=0;
+  (ppRes.data||[]).forEach(p=>PARENT_PENDING.push({
+    code:p.code, relation:p.relation, fatherNom:p.father_nom, fatherPrenom:p.father_prenom,
+    motherNom:p.mother_nom, motherPrenom:p.mother_prenom, auntNom:p.aunt_nom, auntPrenom:p.aunt_prenom,
+    uncleNom:p.uncle_nom, unclePrenom:p.uncle_prenom, eleveNom:p.eleve_nom, elevePrenom:p.eleve_prenom,
+    classe:p.classe, status:p.status, date:new Date(p.created_at),
+  }));
   SECURITY_LOG.length=0;
   (secRes.data||[]).forEach(l=>{
     SECURITY_LOG.push({date:new Date(l.created_at), user:l.user_name||'Inconnu', action:l.action, device:l.device||'—', result:l.result});
@@ -235,6 +245,7 @@ async function loadFromSupabase(){
     ACCOUNTS[a.number] = {
       number:a.number, nom:a.nom, prenom:a.prenom, role:a.role, classe:a.classe,
       name:a.prenom+' '+a.nom, balance:Number(a.balance), status:a.status, accountType:a.account_type, password:a.password,
+      eleveNom:a.eleve_nom, elevePrenom:a.eleve_prenom, relation:a.relation,
       cards:[], transactions:[], notifications:[], createdAt:new Date(a.created_at),
     };
   });
@@ -271,6 +282,7 @@ function startRealtime(){
     .on('postgres_changes', {event:'*', schema:'public', table:'notifications'}, syncAll)
     .on('postgres_changes', {event:'*', schema:'public', table:'recharge_requests'}, syncAll)
     .on('postgres_changes', {event:'*', schema:'public', table:'withdraw_requests'}, syncAll)
+    .on('postgres_changes', {event:'*', schema:'public', table:'parent_pending'}, syncAll)
     .subscribe();
 }
 
@@ -284,15 +296,68 @@ let ticker = null;
 /* ============================================================
    GATE
 ============================================================ */
+let currentAdmin = null;
+async function boot(){
+  const { data: admins } = await sb.from('bank_admins').select('*').order('created_at');
+  if(!admins || admins.length===0){ renderGateCreate(); }
+  else { renderGateLogin(admins); }
+}
+function renderGateCreate(){
+  document.getElementById('gate-body').innerHTML = `
+    <p style="color:#A9B8E4;font-size:12px;margin:-6px 0 18px;">Aucun administrateur n'existe encore — créez le premier compte.</p>
+    <div class="field" style="text-align:left;"><label style="color:#A9B8E4;">Nom</label><input id="ga-nom" placeholder="Nom"></div>
+    <div class="field" style="text-align:left;"><label style="color:#A9B8E4;">Prénom</label><input id="ga-prenom" placeholder="Prénom"></div>
+    <div class="field" style="text-align:left;"><label style="color:#A9B8E4;">Genre</label>
+      <select id="ga-genre" style="width:100%;padding:13px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.07);color:#fff;font-size:14px;">
+        <option value="Homme">Homme</option><option value="Femme">Femme</option>
+      </select>
+    </div>
+    <input id="ga-pass" type="password" placeholder="Mot de passe">
+    <div id="gate-err" class="gate-err" style="display:none;">Tous les champs sont requis.</div>
+    <button onclick="createAdmin()">Créer le compte administrateur</button>
+  `;
+}
+async function createAdmin(){
+  const nom=document.getElementById('ga-nom').value.trim();
+  const prenom=document.getElementById('ga-prenom').value.trim();
+  const genre=document.getElementById('ga-genre').value;
+  const pass=document.getElementById('ga-pass').value;
+  if(!nom||!prenom||!pass){ document.getElementById('gate-err').style.display='block'; return; }
+  const id = genId('ADM');
+  await sb.from('bank_admins').insert({id,nom,prenom,genre,password:pass});
+  currentAdmin = {id,nom,prenom,genre};
+  enterApp();
+}
+function renderGateLogin(admins){
+  document.getElementById('gate-body').innerHTML = `
+    <div class="field" style="text-align:left;"><label style="color:#A9B8E4;">Administrateur</label>
+      <select id="ga-select" style="width:100%;padding:13px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.07);color:#fff;font-size:14px;">
+        ${admins.map(a=>`<option value="${a.id}">${a.prenom} ${a.nom}</option>`).join('')}
+      </select>
+    </div>
+    <input id="gate-pass" type="password" placeholder="Mot de passe">
+    <div id="gate-err" class="gate-err" style="display:none;">Mot de passe incorrect.</div>
+    <button onclick="gateLogin()">Accéder au dashboard</button>
+    <div class="gate-hint">Seul ce dashboard peut créer des comptes parents pour "index".</div>
+  `;
+  window._admins = admins;
+}
 async function gateLogin(){
-  const v = document.getElementById('gate-pass').value;
-  if(v!=='admin123'){ document.getElementById('gate-err').style.display='block'; return; }
+  const id = document.getElementById('ga-select').value;
+  const pass = document.getElementById('gate-pass').value;
+  const admin = window._admins.find(a=>a.id===id);
+  if(!admin || admin.password!==pass){ document.getElementById('gate-err').style.display='block'; return; }
+  currentAdmin = admin;
+  enterApp();
+}
+async function enterApp(){
   document.getElementById('gate').style.display='none';
   document.getElementById('app').innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:var(--muted);">Chargement des données…</div>`;
   try{ await loadFromSupabase(); }catch(e){ console.error('Supabase load failed',e); }
   renderApp();
   startRealtime();
 }
+boot();
 
 /* ============================================================
    SHELL
@@ -300,6 +365,7 @@ async function gateLogin(){
 const NAV = [
   ['dashboard','home','Dashboard'],
   ['utilisateurs','users','Utilisateurs'],
+  ['parents','users','Parents'],
   ['comptes','bank','Comptes'],
   ['cartes','card','Cartes'],
   ['transactions','trend','Transactions'],
@@ -343,7 +409,7 @@ function renderApp(){
 function go(page){ state.page=page; renderApp(); }
 function renderPage(){
   const c = document.getElementById('content');
-  const pages = {dashboard:pgDashboard,utilisateurs:pgUtilisateurs,comptes:pgComptes,cartes:pgCartes,transactions:pgTransactions,paiements:pgPaiements,analytics:pgAnalytics,securite:pgSecurite,notifications:pgNotifications,parametres:pgParametres};
+  const pages = {dashboard:pgDashboard,utilisateurs:pgUtilisateurs,parents:pgParents,comptes:pgComptes,cartes:pgCartes,transactions:pgTransactions,paiements:pgPaiements,analytics:pgAnalytics,securite:pgSecurite,notifications:pgNotifications,parametres:pgParametres};
   c.innerHTML = (pages[state.page]||pgDashboard)();
   requestAnimationFrame(()=>{ drawCharts(); ensureTicker(); });
 }
@@ -406,6 +472,102 @@ function pgDashboard(){
 /* ============================================================
    UTILISATEURS
 ============================================================ */
+/* ============================================================
+   PARENTS — seul cet admin peut créer des comptes parents pour "index"
+============================================================ */
+function pgParents(){
+  const parentAccounts = allAccounts().filter(a=>a.role==='parent');
+  const pending = PARENT_PENDING.filter(p=>p.status==='pending');
+  return `
+  <div class="page-title"><div><h1>Parents</h1><p>Créez et gérez les comptes parents de "index" — seul ce dashboard peut en créer</p></div>
+    <button class="btn primary" onclick="openCreateParent()">+ Ajouter un parent</button></div>
+
+  <div class="card-head" style="margin-bottom:8px;"><h3>Codes en attente (${pending.length})</h3></div>
+  <div class="card">
+    <table class="table"><thead><tr><th>Code</th><th>Parent</th><th>Élève</th><th>Classe</th><th>Créé le</th></tr></thead>
+    <tbody>${pending.map(p=>{
+      const name = p.relation==='pere' ? p.fatherPrenom+' '+p.fatherNom : p.motherPrenom+' '+p.motherNom;
+      return `<tr><td style="font-family:'Manrope';font-weight:800;letter-spacing:2px;">${p.code}</td><td>${name}</td><td>${p.elevePrenom} ${p.eleveNom}</td><td>${p.classe}</td><td>${p.date.toLocaleDateString('fr-FR')}</td></tr>`;
+    }).join('') || `<tr><td colspan="5"><div class="empty">Aucun code en attente</div></td></tr>`}</tbody></table>
+  </div>
+
+  <div class="card-head" style="margin:20px 0 8px;"><h3>Comptes parents actifs (${parentAccounts.length})</h3></div>
+  <div class="card">
+    <table class="table"><thead><tr><th>Parent</th><th>Élève lié</th><th>Classe</th><th>N° de compte</th><th>Statut</th></tr></thead>
+    <tbody>${parentAccounts.map(a=>`
+      <tr onclick="openUserDetail('${a.number}')"><td><div class="name-cell"><div class="av-sm" style="background:${colorFor(a.number)}">${(a.prenom[0]+a.nom[0]).toUpperCase()}</div><b>${a.name}</b></div></td><td>${a.elevePrenom||''} ${a.eleveNom||''}</td><td>${a.classe||''}</td><td>${a.number}</td><td>${a.status==='suspended'?`<span class="badge fail">Suspendu</span>`:`<span class="badge ok">Actif</span>`}</td></tr>
+    `).join('') || `<tr><td colspan="5"><div class="empty">Aucun compte parent actif</div></td></tr>`}</tbody></table>
+  </div>`;
+}
+function openCreateParent(){
+  openModal(`
+    <button class="close-x" onclick="closeModal()">${icon('x',14)}</button>
+    <h3>Ajouter un parent</h3>
+    <div class="field"><label>Ce parent est</label>
+      <select id="cp-relation" onchange="updateParentRelationFields()">
+        <option value="pere">Père</option>
+        <option value="mere">Mère</option>
+      </select>
+    </div>
+    <div id="cp-pere-fields">
+      <div class="field"><label>Nom du père</label><input id="cp-father-nom" placeholder="Nom"></div>
+      <div class="field"><label>Prénom du père</label><input id="cp-father-prenom" placeholder="Prénom"></div>
+    </div>
+    <div id="cp-mere-fields" style="display:none;">
+      <div class="field"><label>Nom de la mère</label><input id="cp-mother-nom" placeholder="Nom"></div>
+      <div class="field"><label>Prénom de la mère</label><input id="cp-mother-prenom" placeholder="Prénom"></div>
+    </div>
+    <div class="field"><label>Nom de la tante (optionnel)</label><input id="cp-aunt-nom" placeholder="Nom"></div>
+    <div class="field"><label>Prénom de la tante (optionnel)</label><input id="cp-aunt-prenom" placeholder="Prénom"></div>
+    <div class="field"><label>Nom de l'oncle (optionnel)</label><input id="cp-uncle-nom" placeholder="Nom"></div>
+    <div class="field"><label>Prénom de l'oncle (optionnel)</label><input id="cp-uncle-prenom" placeholder="Prénom"></div>
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0;">
+    <div class="field"><label>Nom de l'élève</label><input id="cp-eleve-nom" placeholder="Nom de l'élève"></div>
+    <div class="field"><label>Prénom de l'élève</label><input id="cp-eleve-prenom" placeholder="Prénom de l'élève"></div>
+    <div class="field"><label>Classe</label><select id="cp-classe">${CLASSES.map(c=>`<option>${c}</option>`).join('')}</select></div>
+    <button class="btn primary" style="width:100%;" onclick="createParentPending()">Générer le code</button>
+  `);
+}
+function updateParentRelationFields(){
+  const rel = document.getElementById('cp-relation').value;
+  document.getElementById('cp-pere-fields').style.display = rel==='pere' ? 'block' : 'none';
+  document.getElementById('cp-mere-fields').style.display = rel==='mere' ? 'block' : 'none';
+}
+async function createParentPending(){
+  const relation = document.getElementById('cp-relation').value;
+  const fatherNom = document.getElementById('cp-father-nom').value.trim();
+  const fatherPrenom = document.getElementById('cp-father-prenom').value.trim();
+  const motherNom = document.getElementById('cp-mother-nom').value.trim();
+  const motherPrenom = document.getElementById('cp-mother-prenom').value.trim();
+  const auntNom = document.getElementById('cp-aunt-nom').value.trim();
+  const auntPrenom = document.getElementById('cp-aunt-prenom').value.trim();
+  const uncleNom = document.getElementById('cp-uncle-nom').value.trim();
+  const unclePrenom = document.getElementById('cp-uncle-prenom').value.trim();
+  const eleveNom = document.getElementById('cp-eleve-nom').value.trim();
+  const elevePrenom = document.getElementById('cp-eleve-prenom').value.trim();
+  const classe = document.getElementById('cp-classe').value;
+  if(relation==='pere' && (!fatherNom||!fatherPrenom)){ toast('Nom et prénom du père requis'); return; }
+  if(relation==='mere' && (!motherNom||!motherPrenom)){ toast('Nom et prénom de la mère requis'); return; }
+  if(!eleveNom||!elevePrenom){ toast("Nom et prénom de l'élève requis"); return; }
+  let code; do{ code=String(Math.floor(100000+Math.random()*899999)); }while(PARENT_PENDING.some(p=>p.code===code));
+  await sb.from('parent_pending').insert({
+    code, relation, father_nom:fatherNom||null, father_prenom:fatherPrenom||null,
+    mother_nom:motherNom||null, mother_prenom:motherPrenom||null,
+    aunt_nom:auntNom||null, aunt_prenom:auntPrenom||null, uncle_nom:uncleNom||null, uncle_prenom:unclePrenom||null,
+    eleve_nom:eleveNom, eleve_prenom:elevePrenom, classe, status:'pending',
+  });
+  closeModal();
+  openModal(`
+    <button class="close-x" onclick="closeModal()">${icon('x',14)}</button>
+    <div style="text-align:center;">
+      <h3>Code généré</h3>
+      <p style="color:var(--muted);font-size:12.5px;">Communiquez ce code oralement au parent — il devra le saisir dans l'app "index" pour créer son mot de passe.</p>
+      <div class="code-box" style="margin:18px 0;"><p class="cl">Code parent</p><p class="cv">${code}</p></div>
+      <button class="btn primary" style="width:100%;" onclick="closeModal();go('parents')">Terminé</button>
+    </div>
+  `);
+}
+
 let userFilter='Tous', userQuery='';
 function pgUtilisateurs(){
   const filters=['Tous','Élèves','Parents','Professeurs','Personnel'];
