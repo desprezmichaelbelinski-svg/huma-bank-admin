@@ -232,11 +232,7 @@ function todayStr2(d){
   return d.toLocaleDateString('fr-FR');
 }
 async function loadFromSupabase(){
-  const [accRes, cardRes, txRes, notifRes, rcRes, wdRes, secRes, setRes, ppRes] = await Promise.all([
-    sb.from('accounts').select('*'),
-    sb.from('cards').select('*'),
-    sb.from('transactions').select('*').order('created_at',{ascending:false}),
-    sb.from('notifications').select('*').order('created_at',{ascending:false}),
+  const [rcRes, wdRes, secRes, setRes, ppRes] = await Promise.all([
     sb.from('recharge_requests').select('*').order('created_at',{ascending:false}),
     sb.from('withdraw_requests').select('*').order('created_at',{ascending:false}),
     sb.from('security_log').select('*').order('created_at',{ascending:false}).limit(50),
@@ -255,46 +251,67 @@ async function loadFromSupabase(){
     SECURITY_LOG.push({date:new Date(l.created_at), user:l.user_name||'Inconnu', action:l.action, device:l.device||'—', result:l.result});
   });
   if(setRes.data && setRes.data.value){ Object.assign(settings, setRes.data.value); }
-  for(const k in ACCOUNTS) delete ACCOUNTS[k];
-  (accRes.data||[]).forEach(a=>{
-    ACCOUNTS[a.number] = {
-      number:a.number, nom:a.nom, prenom:a.prenom, role:a.role, classe:a.classe,
-      name:a.prenom+' '+a.nom, balance:Number(a.balance), status:a.status, accountType:a.account_type, password:a.password,
-      eleveNom:a.eleve_nom, elevePrenom:a.eleve_prenom, relation:a.relation,
-      cards:[], transactions:[], notifications:[], createdAt:new Date(a.created_at),
-    };
-  });
-  (cardRes.data||[]).forEach(c=>{
-    const acc=ACCOUNTS[c.account_number]; if(!acc) return;
-    acc.cards.push({id:c.id, holder:c.holder, last4:c.last4, frozen:c.frozen, cardBalance:Number(c.card_balance)});
-  });
-  (txRes.data||[]).forEach(t=>{
-    const acc=ACCOUNTS[t.account_number]; if(!acc) return;
-    const d=new Date(t.created_at);
-    acc.transactions.push({id:t.id, desc:t.description, cat:t.category, amount:Number(t.amount), date:d, label:todayStr2(d)});
-  });
-  (notifRes.data||[]).forEach(n=>{
-    const acc=ACCOUNTS[n.account_number]; if(!acc) return;
-    acc.notifications.push({id:n.id, text:n.text, read:n.read, date:new Date(n.created_at)});
-  });
+
+  // Ne charge que les comptes RÉFÉRENCÉS par les demandes en cours — pas les 20 000 comptes.
+  const neededNumbers = new Set([...(rcRes.data||[]).map(r=>r.account_number), ...(wdRes.data||[]).map(r=>r.account_number)]);
+  if(neededNumbers.size>0){
+    const { data:accData } = await sb.from('accounts').select('*').in('number',[...neededNumbers]);
+    (accData||[]).forEach(a=>{ ACCOUNTS[a.number] = ACCOUNTS[a.number] || mapAccountRow(a); });
+  }
   RECHARGE_REQUESTS.length=0;
   (rcRes.data||[]).forEach(r=>{
     const acc=ACCOUNTS[r.account_number];
-    RECHARGE_REQUESTS.push({id:r.id, accountNumber:r.account_number, name:acc?acc.name:r.account_number, method:r.method, amount:Number(r.amount), ref:r.ref, status:r.status, date:new Date(r.created_at)});
+    RECHARGE_REQUESTS.push({id:r.id, accountNumber:r.account_number, name:acc?acc.name:r.account_number, method:r.method, amount:Number(r.amount), ref:r.ref, status:r.status, date:new Date(r.created_at), resolvedAt:r.resolved_at});
   });
   WITHDRAW_REQUESTS.length=0;
   (wdRes.data||[]).forEach(r=>{
     const acc=ACCOUNTS[r.account_number];
-    WITHDRAW_REQUESTS.push({id:r.id, accountNumber:r.account_number, name:acc?acc.name:r.account_number, amount:Number(r.amount), fee:Number(r.fee), total:Number(r.total), status:r.status, date:new Date(r.created_at)});
+    WITHDRAW_REQUESTS.push({id:r.id, accountNumber:r.account_number, name:acc?acc.name:r.account_number, amount:Number(r.amount), fee:Number(r.fee), total:Number(r.total), status:r.status, date:new Date(r.created_at), resolvedAt:r.resolved_at});
   });
+  await sb.rpc('cleanup_old_requests');
+}
+function mapAccountRow(a){
+  return {
+    number:a.number, nom:a.nom, prenom:a.prenom, role:a.role, classe:a.classe,
+    name:a.prenom+' '+a.nom, balance:Number(a.balance), status:a.status, accountType:a.account_type, password:a.password,
+    eleveNom:a.eleve_nom, elevePrenom:a.eleve_prenom, relation:a.relation,
+    cards:[], transactions:[], notifications:[], createdAt:new Date(a.created_at),
+  };
+}
+// Recherche en direct — retrouve n'importe lequel des 20 000 comptes par nom ou numéro
+async function searchAccountsLive(query){
+  const q = query.trim();
+  if(q.length<2) return [];
+  const isNumber = /^\d+$/.test(q);
+  let req = sb.from('accounts').select('*').limit(30);
+  req = isNumber ? req.ilike('number', q+'%') : req.or(`nom.ilike.%${q}%,prenom.ilike.%${q}%`);
+  const { data } = await req;
+  const numbers = (data||[]).map(a=>a.number);
+  const { data:cardData } = numbers.length ? await sb.from('cards').select('*').in('account_number',numbers) : {data:[]};
+  (data||[]).forEach(a=>{
+    const acc = mapAccountRow(a);
+    (cardData||[]).filter(c=>c.account_number===a.number).forEach(c=>acc.cards.push({id:c.id, holder:c.holder, last4:c.last4, frozen:c.frozen, cardBalance:Number(c.card_balance)}));
+    ACCOUNTS[a.number] = acc;
+  });
+  return (data||[]).map(a=>ACCOUNTS[a.number]);
+}
+// Charge un compte précis en direct (fiche détaillée, actions admin)
+async function loadOneAccount(number){
+  const { data } = await sb.from('accounts').select('*').eq('number',number).maybeSingle();
+  if(!data) return null;
+  const acc = mapAccountRow(data);
+  const [cardRes, txRes] = await Promise.all([
+    sb.from('cards').select('*').eq('account_number',number),
+    sb.from('transactions').select('*').eq('account_number',number).order('created_at',{ascending:false}).limit(100),
+  ]);
+  (cardRes.data||[]).forEach(c=>acc.cards.push({id:c.id, holder:c.holder, last4:c.last4, frozen:c.frozen, cardBalance:Number(c.card_balance)}));
+  (txRes.data||[]).forEach(t=>{ const d=new Date(t.created_at); acc.transactions.push({id:t.id, desc:t.description, cat:t.category, amount:Number(t.amount), date:d, label:todayStr2(d)}); });
+  ACCOUNTS[number] = acc;
+  return acc;
 }
 async function syncAll(){ await loadFromSupabase(); if(document.getElementById('gate').style.display==='none') renderPage(); }
 function startRealtime(){
   sb.channel('admin-sync')
-    .on('postgres_changes', {event:'*', schema:'public', table:'accounts'}, syncAll)
-    .on('postgres_changes', {event:'*', schema:'public', table:'cards'}, syncAll)
-    .on('postgres_changes', {event:'*', schema:'public', table:'transactions'}, syncAll)
-    .on('postgres_changes', {event:'*', schema:'public', table:'notifications'}, syncAll)
     .on('postgres_changes', {event:'*', schema:'public', table:'recharge_requests'}, syncAll)
     .on('postgres_changes', {event:'*', schema:'public', table:'withdraw_requests'}, syncAll)
     .on('postgres_changes', {event:'*', schema:'public', table:'parent_pending'}, syncAll)
@@ -368,7 +385,7 @@ async function gateLogin(){
 async function enterApp(){
   document.getElementById('gate').style.display='none';
   document.getElementById('app').innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:var(--muted);">Chargement des données…</div>`;
-  try{ await loadFromSupabase(); }catch(e){ console.error('Supabase load failed',e); }
+  try{ await Promise.all([loadFromSupabase(), loadDashboardStats(), loadParentAccounts()]); }catch(e){ console.error('Supabase load failed',e); }
   renderApp();
   startRealtime();
   try{ if(!localStorage.getItem('huma_admin_tour_seen')) setTimeout(()=>startTour(TOUR_ADMIN,'huma_admin_tour_seen'),600); }catch(e){}
@@ -422,7 +439,7 @@ function renderApp(){
   </div>`;
   renderPage();
 }
-function go(page){ state.page=page; renderApp(); }
+function go(page){ state.page=page; renderApp(); if(page==='dashboard') loadDashboardStats().then(renderPage); if(page==='parents') loadParentAccounts().then(renderPage); if(page==='transactions') loadTransactions().then(renderPage); if(page==='paiements') loadCafTransactions().then(renderPage); }
 function renderPage(){
   const c = document.getElementById('content');
   const pages = {dashboard:pgDashboard,utilisateurs:pgUtilisateurs,parents:pgParents,comptes:pgComptes,cartes:pgCartes,transactions:pgTransactions,paiements:pgPaiements,analytics:pgAnalytics,securite:pgSecurite,notifications:pgNotifications,parametres:pgParametres};
@@ -432,28 +449,42 @@ function renderPage(){
 function allAccounts(){ return Object.values(ACCOUNTS); }
 function roleCount(r){ return allAccounts().filter(a=>a.role===r).length; }
 
-function globalSearch(q){
+async function globalSearch(q){
   q=q.trim();
   if(q.length<2) return;
-  const acc = allAccounts().find(a=>a.number===q || a.name.toLowerCase().includes(q.toLowerCase()));
-  if(acc){ go('utilisateurs'); setTimeout(()=>openUserDetail(acc.number),50); }
+  go('utilisateurs');
+  userQuery = q;
+  userSearchResults = await searchAccountsLive(q);
+  renderPage();
+  if(userSearchResults.length===1) openUserDetail(userSearchResults[0].number);
 }
 
 /* ============================================================
    DASHBOARD
 ============================================================ */
+let dashStats = {total_users:0, total_balance:0, today_tx_count:0, suspended_count:0, role_counts:{}};
+let recentTx = [];
+async function loadDashboardStats(){
+  const { data } = await sb.rpc('get_dashboard_stats');
+  if(data) dashStats = data;
+  const { data:txData } = await sb.from('transactions').select('*').order('created_at',{ascending:false}).limit(5);
+  const numbers = [...new Set((txData||[]).map(t=>t.account_number))];
+  let names = {};
+  if(numbers.length){
+    const { data:accData } = await sb.from('accounts').select('number,nom,prenom').in('number',numbers);
+    (accData||[]).forEach(a=>{ names[a.number]=a.prenom+' '+a.nom; });
+  }
+  recentTx = (txData||[]).map(t=>({id:t.id, who:names[t.account_number]||t.account_number, cat:t.category, amount:Number(t.amount), date:new Date(t.created_at)}));
+}
 function pgDashboard(){
-  const accs = allAccounts();
-  const totalBalance = accs.reduce((a,b)=>a+b.balance,0);
-  const allTx = accs.flatMap(a=>a.transactions);
-  const todayTx = allTx.filter(t=>t.date.toDateString()===new Date().toDateString()).length;
-  const alerts = pendingCount() + accs.filter(a=>a.status==='suspended').length + SECURITY_LOG.filter(l=>l.result==='fail').length;
+  const alerts = pendingCount() + dashStats.suspended_count + SECURITY_LOG.filter(l=>l.result==='fail').length;
+  const rc = dashStats.role_counts||{};
   return `
   <div class="page-title"><div><h1>Vue d'ensemble</h1><p>Centre de contrôle HUMA BANK — Grand Collège l'Humanisme</p></div></div>
   <div class="kpi-row" style="grid-template-columns:repeat(3,1fr);">
-    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('users',16)}</span>Utilisateurs</p><p class="kv">${accs.length}</p><p class="kd" style="color:var(--pos);">+${accs.length} ce mois</p></div>
-    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('wallet',16)}</span>Volume financier</p><p class="kv tnum">${money(totalBalance)}</p></div>
-    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('trend',16)}</span>Transactions aujourd'hui</p><p class="kv">${todayTx}</p></div>
+    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('users',16)}</span>Utilisateurs</p><p class="kv">${dashStats.total_users}</p></div>
+    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('wallet',16)}</span>Volume financier</p><p class="kv tnum">${money(dashStats.total_balance)}</p></div>
+    <div class="kpi-card"><p class="kl"><span class="kicon">${icon('trend',16)}</span>Transactions aujourd'hui</p><p class="kv">${dashStats.today_tx_count}</p></div>
   </div>
   <div class="grid-2">
     <div class="card">
@@ -468,7 +499,7 @@ function pgDashboard(){
         <div style="width:110px;flex-shrink:0;"><canvas id="role-chart" height="110"></canvas></div>
         <div style="flex:1;">
           ${[['eleve','Élèves','#0C2350'],['professeur','Professeurs','#2748A0'],['personnel','Personnel','#3E5FC4'],['parent','Parents','#8FA6F5']].map(([r,l,c])=>`
-            <div style="display:flex;align-items:center;gap:8px;padding:5px 0;font-size:12px;"><span style="width:9px;height:9px;border-radius:3px;background:${c};display:inline-block;"></span>${l}<span style="margin-left:auto;font-weight:700;">${roleCount(r)}</span></div>`).join('')}
+            <div style="display:flex;align-items:center;gap:8px;padding:5px 0;font-size:12px;"><span style="width:9px;height:9px;border-radius:3px;background:${c};display:inline-block;"></span>${l}<span style="margin-left:auto;font-weight:700;">${rc[r]||0}</span></div>`).join('')}
         </div>
       </div>
     </div>
@@ -477,10 +508,7 @@ function pgDashboard(){
     <div class="card-head"><h3>Transactions récentes</h3><button class="btn ghost" onclick="go('transactions')">Voir tout</button></div>
     <table class="table"><thead><tr><th>ID</th><th>Utilisateur</th><th>Type</th><th>Montant</th><th>Date</th><th>Statut</th></tr></thead>
     <tbody>
-      ${allTx.sort((a,b)=>b.date-a.date).slice(0,5).map(t=>{
-        const owner = accs.find(a=>a.transactions.includes(t));
-        return `<tr onclick="openTxDetail('${t.id}')"><td>${t.id}</td><td>${owner?owner.name:'—'}</td><td>${t.cat}</td><td class="tnum">${money(t.amount)}</td><td>${t.date.toLocaleDateString('fr-FR')}</td><td><span class="badge ok">Réussi</span></td></tr>`;
-      }).join('') || `<tr><td colspan="6"><div class="empty">Aucune transaction</div></td></tr>`}
+      ${recentTx.map(t=>`<tr><td>${t.id}</td><td>${t.who}</td><td>${t.cat}</td><td class="tnum">${money(t.amount)}</td><td>${t.date.toLocaleDateString('fr-FR')}</td><td><span class="badge ok">Réussi</span></td></tr>`).join('') || `<tr><td colspan="6"><div class="empty">Aucune transaction</div></td></tr>`}
     </tbody></table>
   </div>`;
 }
@@ -491,8 +519,13 @@ function pgDashboard(){
 /* ============================================================
    PARENTS — seul cet admin peut créer des comptes parents pour "index"
 ============================================================ */
+let parentAccountsList = [];
+async function loadParentAccounts(){
+  const { data } = await sb.from('accounts').select('*').eq('role','parent').order('created_at',{ascending:false}).limit(300);
+  parentAccountsList = (data||[]).map(a=>{ ACCOUNTS[a.number]=ACCOUNTS[a.number]||mapAccountRow(a); return ACCOUNTS[a.number]; });
+}
 function pgParents(){
-  const parentAccounts = allAccounts().filter(a=>a.role==='parent');
+  const parentAccounts = parentAccountsList;
   const pending = PARENT_PENDING.filter(p=>p.status==='pending');
   return `
   <div class="page-title"><div><h1>Parents</h1><p>Créez et gérez les comptes parents de "index" — seul ce dashboard peut en créer</p></div>
@@ -585,17 +618,16 @@ async function createParentPending(){
 }
 
 let userFilter='Tous', userQuery='';
+let userSearchResults = [];
 function pgUtilisateurs(){
   const filters=['Tous','Élèves','Parents','Professeurs','Personnel'];
-  const map={'Élèves':'eleve','Parents':'parent','Professeurs':'professeur','Personnel':'personnel'};
-  let accs = allAccounts();
-  if(userFilter!=='Tous') accs = accs.filter(a=>a.role===map[userFilter]);
-  if(userQuery) accs = accs.filter(a=>a.name.toLowerCase().includes(userQuery.toLowerCase())||a.number.includes(userQuery));
+  let accs = userSearchResults;
+  if(userFilter!=='Tous'){ const map={'Élèves':'eleve','Parents':'parent','Professeurs':'professeur','Personnel':'personnel'}; accs = accs.filter(a=>a.role===map[userFilter]); }
   return `
-  <div class="page-title"><div><h1>Utilisateurs</h1><p>${allAccounts().length} comptes enregistrés — créés automatiquement depuis l'app</p></div></div>
+  <div class="page-title"><div><h1>Utilisateurs</h1><p>Recherchez parmi tous les comptes de l'établissement (nom ou numéro)</p></div></div>
   <div class="subnav">${filters.map(f=>`<button class="${userFilter===f?'active':''}" onclick="userFilter='${f}';renderPage()">${f}</button>`).join('')}</div>
   <div class="card">
-    <div class="search-wrap" style="max-width:320px;margin-bottom:14px;">${icon('search',15)}<input placeholder="Rechercher..." value="${userQuery}" oninput="userQuery=this.value;renderPage()"></div>
+    <div class="search-wrap" style="max-width:420px;margin-bottom:14px;">${icon('search',15)}<input placeholder="Rechercher par nom ou numéro (min. 2 caractères)..." value="${userQuery}" oninput="onUserSearch(this.value)"></div>
     <table class="table"><thead><tr><th>Utilisateur</th><th>Type</th><th>Compte</th><th>Solde</th><th>Statut</th><th>Créé le</th></tr></thead>
     <tbody>
       ${accs.map(a=>`
@@ -606,9 +638,15 @@ function pgUtilisateurs(){
           <td class="tnum">${money(a.balance)}</td>
           <td>${a.status==='suspended'?`<span class="badge fail">Suspendu</span>`:`<span class="badge ok">Actif</span>`}</td>
           <td>${a.createdAt.toLocaleDateString('fr-FR')}</td>
-        </tr>`).join('') || `<tr><td colspan="6"><div class="empty">Aucun utilisateur trouvé</div></td></tr>`}
+        </tr>`).join('') || `<tr><td colspan="6"><div class="empty">${userQuery.length<2 ? 'Tapez un nom ou un numéro pour rechercher parmi tous les comptes.' : 'Aucun utilisateur trouvé.'}</div></td></tr>`}
     </tbody></table>
   </div>`;
+}
+let userSearchDebounce=null;
+function onUserSearch(v){
+  userQuery=v; renderPage();
+  clearTimeout(userSearchDebounce);
+  userSearchDebounce=setTimeout(async ()=>{ userSearchResults = await searchAccountsLive(v); renderPage(); }, 300);
 }
 function openCreateUser(){
   openModal(`
@@ -635,9 +673,11 @@ function createUser(){
 
 /* ---- Fiche utilisateur détaillée ---- */
 let userDetailTab='general';
-function openUserDetail(num){
+async function openUserDetail(num){
   userDetailTab='general';
-  const acc = ACCOUNTS[num];
+  openModal(`<div class="loading-wrap"><div class="spinner"></div><p>Chargement...</p></div>`);
+  const acc = await loadOneAccount(num);
+  if(!acc){ closeModal(); toast('Compte introuvable'); return; }
   openModal(userDetailHTML(acc), true);
 }
 function userDetailHTML(acc){
@@ -724,7 +764,7 @@ async function doDebit(num){
    COMPTES
 ============================================================ */
 function pgComptes(){
-  const accs = allAccounts();
+  const accs = userSearchResults;
   const courants = accs.filter(a=>a.accountType!=='certifie');
   const certifies = accs.filter(a=>a.accountType==='certifie');
   const rowsHTML = list => list.map(a=>`
@@ -737,16 +777,19 @@ function pgComptes(){
           <td>${a.status==='suspended'?`<span class="badge fail">Suspendu</span>`:`<span class="badge ok">Actif</span>`}</td>
         </tr>`).join('');
   return `
-  <div class="page-title"><div><h1>Comptes</h1><p>Tous les comptes bancaires de l'établissement</p></div></div>
+  <div class="page-title"><div><h1>Comptes</h1><p>Recherchez un compte pour voir s'il est certifié ou non</p></div></div>
+  <div class="card" style="margin-bottom:16px;">
+    <div class="search-wrap" style="max-width:420px;">${icon('search',15)}<input placeholder="Rechercher par nom ou numéro (min. 2 caractères)..." value="${userQuery}" oninput="onUserSearch(this.value)"></div>
+  </div>
   <div class="card-head" style="margin-bottom:8px;"><h3>Comptes courants (${courants.length})</h3></div>
   <div class="card">
     <table class="table"><thead><tr><th>N° de compte</th><th>Titulaire</th><th>Type</th><th>Solde</th><th>Devise</th><th>Statut</th></tr></thead>
-    <tbody>${rowsHTML(courants) || `<tr><td colspan="6"><div class="empty">Aucun compte courant</div></td></tr>`}</tbody></table>
+    <tbody>${rowsHTML(courants) || `<tr><td colspan="6"><div class="empty">${userQuery.length<2?'Recherchez un compte ci-dessus.':'Aucun résultat.'}</div></td></tr>`}</tbody></table>
   </div>
   <div class="card-head" style="margin:20px 0 8px;"><h3>Comptes certifiés (${certifies.length}) <span class="badge" style="background:#E3EEFF;color:#1F5FD6;">✓</span></h3></div>
   <div class="card">
     <table class="table"><thead><tr><th>N° de compte</th><th>Titulaire</th><th>Type</th><th>Solde</th><th>Devise</th><th>Statut</th></tr></thead>
-    <tbody>${rowsHTML(certifies) || `<tr><td colspan="6"><div class="empty">Aucun compte certifié</div></td></tr>`}</tbody></table>
+    <tbody>${rowsHTML(certifies) || `<tr><td colspan="6"><div class="empty">${userQuery.length<2?'Recherchez un compte ci-dessus.':'Aucun résultat.'}</div></td></tr>`}</tbody></table>
   </div>`;
 }
 async function toggleCertify(num){
@@ -760,9 +803,12 @@ async function toggleCertify(num){
    CARTES
 ============================================================ */
 function pgCartes(){
-  const cards = allAccounts().flatMap(a=>a.cards.map(c=>({...c,owner:a})));
+  const cards = userSearchResults.flatMap(a=>a.cards.map(c=>({...c,owner:a})));
   return `
-  <div class="page-title"><div><h1>Cartes</h1><p>${cards.length} carte(s) virtuelle(s) émise(s)</p></div></div>
+  <div class="page-title"><div><h1>Cartes</h1><p>Recherchez un titulaire pour gérer ses cartes</p></div></div>
+  <div class="card" style="margin-bottom:16px;">
+    <div class="search-wrap" style="max-width:420px;">${icon('search',15)}<input placeholder="Rechercher par nom ou numéro (min. 2 caractères)..." value="${userQuery}" oninput="onUserSearch(this.value)"></div>
+  </div>
   <div class="card">
     <table class="table"><thead><tr><th>Titulaire</th><th>4 derniers chiffres</th><th>Solde carte</th><th>Statut</th><th>Actions</th></tr></thead>
     <tbody>
@@ -773,7 +819,7 @@ function pgCartes(){
           <td class="tnum">${money(c.cardBalance)}</td>
           <td>${c.frozen?`<span class="badge fail">Gelée</span>`:`<span class="badge ok">Active</span>`}</td>
           <td><button class="btn ${c.frozen?'ok':'danger'}" onclick="toggleCardFreeze('${c.owner.number}','${c.id}')">${c.frozen?'Débloquer':'Bloquer'}</button></td>
-        </tr>`).join('') || `<tr><td colspan="5"><div class="empty">Aucune carte créée pour le moment</div></td></tr>`}
+        </tr>`).join('') || `<tr><td colspan="5"><div class="empty">${userQuery.length<2?'Recherchez un titulaire ci-dessus.':'Aucune carte trouvée.'}</div></td></tr>`}
     </tbody></table>
   </div>`;
 }
@@ -794,16 +840,26 @@ function dayLabel(d){
   if(days===1) return 'Hier';
   return d.toLocaleDateString('fr-FR');
 }
+let txResults = [];
+async function loadTransactions(){
+  let req = sb.from('transactions').select('*').order('created_at',{ascending:false}).limit(80);
+  if(txFilterType!=='Tous') req = req.eq('category',txFilterType);
+  const { data } = await req;
+  const numbers = [...new Set((data||[]).map(t=>t.account_number))];
+  let names = {};
+  if(numbers.length){
+    const { data:accData } = await sb.from('accounts').select('number,nom,prenom').in('number',numbers);
+    (accData||[]).forEach(a=>{ names[a.number]=a.prenom+' '+a.nom; });
+  }
+  txResults = (data||[]).map(t=>({id:t.id, who:names[t.account_number]||t.account_number, cat:t.category, amount:Number(t.amount), desc:t.description, date:new Date(t.created_at), accountNumber:t.account_number}));
+}
 function pgTransactions(){
   const types=['Tous','Dépôt','Transfert','Reçu','Retrait','Cafétéria'];
-  let all = allAccounts().flatMap(a=>a.transactions.map(t=>({...t,who:a.name})));
-  if(txFilterType!=='Tous') all = all.filter(t=>t.cat===txFilterType);
-  all.sort((a,b)=>b.date-a.date);
   const groups={};
-  all.slice(0,80).forEach(t=>{ const g=dayLabel(t.date); (groups[g]=groups[g]||[]).push(t); });
+  txResults.forEach(t=>{ const g=dayLabel(t.date); (groups[g]=groups[g]||[]).push(t); });
   return `
-  <div class="page-title"><div><h1>Transactions</h1><p>${all.length} transaction(s)</p></div></div>
-  <div class="filter-pills" style="margin-bottom:14px;">${types.map(t=>`<div class="pill ${txFilterType===t?'active':''}" onclick="txFilterType='${t}';renderPage()">${t}</div>`).join('')}</div>
+  <div class="page-title"><div><h1>Transactions</h1><p>${txResults.length} transaction(s) récentes</p></div></div>
+  <div class="filter-pills" style="margin-bottom:14px;">${types.map(t=>`<div class="pill ${txFilterType===t?'active':''}" onclick="txFilterType='${t}';loadTransactions().then(renderPage)">${t}</div>`).join('')}</div>
   ${Object.keys(groups).length===0?`<div class="card"><div class="empty">Aucune transaction</div></div>`:
   Object.entries(groups).map(([label,rows])=>`
     <div class="card-head" style="margin:18px 0 8px;"><h3 style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;">${label}</h3></div>
@@ -813,11 +869,11 @@ function pgTransactions(){
     </div>`).join('')}`;
 }
 function openTxDetail(id){
-  const acc = allAccounts().find(a=>a.transactions.some(t=>t.id===id));
-  const t = acc.transactions.find(t=>t.id===id);
+  const t = txResults.find(x=>x.id===id);
+  if(!t) return;
   openModal(`<button class="close-x" onclick="closeModal()">${icon('x',14)}</button><h3>Détail de la transaction</h3>
   <div class="summary-row"><span>Référence</span><b>${t.id}</b></div>
-  <div class="summary-row"><span>Utilisateur</span><b>${acc.name}</b></div>
+  <div class="summary-row"><span>Utilisateur</span><b>${t.who}</b></div>
   <div class="summary-row"><span>Description</span><b>${t.desc}</b></div>
   <div class="summary-row"><span>Catégorie</span><b>${t.cat}</b></div>
   <div class="summary-row"><span>Montant</span><b class="tnum">${money(t.amount)}</b></div>
@@ -828,20 +884,30 @@ function openTxDetail(id){
 /* ============================================================
    PAIEMENTS SCOLAIRES — Cafétéria uniquement (règle de l'index)
 ============================================================ */
+let cafTxResults = [], cafTxTotal = 0;
+async function loadCafTransactions(){
+  const { data } = await sb.from('transactions').select('*').eq('category','Cafétéria').order('created_at',{ascending:false}).limit(100);
+  const numbers = [...new Set((data||[]).map(t=>t.account_number))];
+  let names = {};
+  if(numbers.length){
+    const { data:accData } = await sb.from('accounts').select('number,nom,prenom').in('number',numbers);
+    (accData||[]).forEach(a=>{ names[a.number]=a.prenom+' '+a.nom; });
+  }
+  cafTxResults = (data||[]).map(t=>({who:names[t.account_number]||t.account_number, amount:Number(t.amount), date:new Date(t.created_at)}));
+  cafTxTotal = cafTxResults.reduce((s,t)=>s+Math.abs(t.amount),0);
+}
 function pgPaiements(){
-  const cafTx = allAccounts().flatMap(a=>a.transactions.filter(t=>t.cat==='Cafétéria').map(t=>({...t,who:a.name})));
-  const total = cafTx.reduce((s,t)=>s+Math.abs(t.amount),0);
   return `
   <div class="page-title"><div><h1>Paiements de la Cafétéria</h1><p>Suivi informatif uniquement</p></div></div>
   <div class="notif-banner" style="margin-bottom:16px;"><div class="ic">${icon('shield',18)}</div><p>La banque n'a aucun droit sur les paiements de la Cafétéria — cette section sert uniquement de preuve de suivi, sans possibilité de modification.</p></div>
   <div class="kpi-row" style="grid-template-columns:repeat(2,1fr);">
-    <div class="kpi-card"><p class="kl">${icon('food',16)} Total payé — Cafétéria</p><p class="kv tnum">${money(total)}</p></div>
-    <div class="kpi-card"><p class="kl">Nombre de paiements</p><p class="kv">${cafTx.length}</p></div>
+    <div class="kpi-card"><p class="kl">${icon('food',16)} Total payé — Cafétéria</p><p class="kv tnum">${money(cafTxTotal)}</p></div>
+    <div class="kpi-card"><p class="kl">Nombre de paiements récents</p><p class="kv">${cafTxResults.length}</p></div>
   </div>
   <div class="card">
     <div class="card-head"><h3>Historique des paiements Cafétéria</h3></div>
     <table class="table"><thead><tr><th>Élève / Utilisateur</th><th>Montant</th><th>Date</th></tr></thead>
-    <tbody>${cafTx.sort((a,b)=>b.date-a.date).map(t=>`<tr><td>${t.who}</td><td class="tnum">${money(t.amount)}</td><td>${t.date.toLocaleDateString('fr-FR')}</td></tr>`).join('') || `<tr><td colspan="3"><div class="empty">Aucun paiement enregistré</div></td></tr>`}</tbody></table>
+    <tbody>${cafTxResults.map(t=>`<tr><td>${t.who}</td><td class="tnum">${money(t.amount)}</td><td>${t.date.toLocaleDateString('fr-FR')}</td></tr>`).join('') || `<tr><td colspan="3"><div class="empty">Aucun paiement enregistré</div></td></tr>`}</tbody></table>
   </div>`;
 }
 
@@ -861,7 +927,7 @@ function pgAnalytics(){
 ============================================================ */
 function pgSecurite(){
   const fails = SECURITY_LOG.filter(l=>l.result==='fail').length;
-  const blocked = allAccounts().filter(a=>a.status==='suspended').length;
+  const blocked = dashStats.suspended_count;
   return `
   <div class="page-title"><div><h1>Centre de sécurité</h1><p>État du système et journal des connexions</p></div></div>
   <div class="kpi-row">
@@ -886,9 +952,9 @@ function pgNotifications(){
     ...WITHDRAW_REQUESTS.map(r=>({...r,kind:'Retrait'})),
   ].sort((a,b)=>b.date-a.date);
   return `
-  <div class="page-title"><div><h1>Notifications</h1><p>Demandes et alertes nécessitant une action</p></div></div>
+  <div class="page-title"><div><h1>Notifications</h1><p>Demandes et alertes nécessitant une action — supprimées automatiquement 48h après traitement</p></div></div>
   <div class="card">
-    <table class="table"><thead><tr><th>Type</th><th>Utilisateur</th><th>Montant</th><th>Date</th><th>Statut</th><th>Action</th></tr></thead>
+    <table class="table"><thead><tr><th>Type</th><th>Utilisateur</th><th>Montant</th><th>Date</th><th>Statut</th><th>Action</th><th></th></tr></thead>
     <tbody>
       ${rows.map(r=>`
         <tr>
@@ -898,9 +964,17 @@ function pgNotifications(){
           <td>${r.date.toLocaleString('fr-FR')}</td>
           <td>${r.status==='pending'?'<span class="badge pending">En attente</span>':r.status==='approved'?'<span class="badge ok">Approuvé</span>':'<span class="badge fail">Refusé</span>'}</td>
           <td>${r.status==='pending'?`<div style="display:flex;gap:6px;"><button class="btn ok" onclick="handleReq('${r.kind}','${r.id}',true)">✓</button><button class="btn danger" onclick="handleReq('${r.kind}','${r.id}',false)">✕</button></div>`:'—'}</td>
-        </tr>`).join('') || `<tr><td colspan="6"><div class="empty">Aucune notification</div></td></tr>`}
+          <td><button class="btn danger" title="Supprimer définitivement" onclick="deleteNotifRow('${r.kind}','${r.id}')">${icon('x',13)}</button></td>
+        </tr>`).join('') || `<tr><td colspan="7"><div class="empty">Aucune notification</div></td></tr>`}
     </tbody></table>
   </div>`;
+}
+async function deleteNotifRow(kind,id){
+  const table = kind==='Recharge' ? 'recharge_requests' : 'withdraw_requests';
+  await sb.from(table).delete().eq('id',id);
+  if(kind==='Recharge'){ const i=RECHARGE_REQUESTS.findIndex(r=>r.id===id); if(i>-1) RECHARGE_REQUESTS.splice(i,1); }
+  else { const i=WITHDRAW_REQUESTS.findIndex(r=>r.id===id); if(i>-1) WITHDRAW_REQUESTS.splice(i,1); }
+  renderPage(); toast('Notification supprimée');
 }
 async function handleReq(kind,id,approve){
   const list = kind==='Recharge'?RECHARGE_REQUESTS:WITHDRAW_REQUESTS;
@@ -910,31 +984,43 @@ async function handleReq(kind,id,approve){
   if(!acc){
     const { data } = await sb.from('accounts').select('*').eq('number',r.accountNumber).maybeSingle();
     if(!data){ toast('Compte introuvable — impossible de traiter cette demande'); return; }
-    acc = ACCOUNTS[r.accountNumber] = {
-      number:data.number, nom:data.nom, prenom:data.prenom, role:data.role, classe:data.classe,
-      name:data.prenom+' '+data.nom, balance:Number(data.balance), status:data.status, accountType:data.account_type, password:data.password,
-      cards:[], transactions:[], notifications:[], createdAt:new Date(data.created_at),
-    };
+    acc = ACCOUNTS[r.accountNumber] = mapAccountRow(data);
   }
+  const nowIso = new Date().toISOString();
   if(approve){
     let tx, notifText;
-    if(kind==='Recharge'){ acc.balance+=r.amount; tx={id:genId('HB'),desc:'Recharge '+r.method+' approuvée',cat:'Dépôt',amount:r.amount,date:new Date()}; notifText=`Votre recharge de ${fmt(r.amount)} a été approuvée.`; }
-    else { acc.balance-=r.total; tx={id:genId('HB'),desc:'Retrait approuvé',cat:'Retrait',amount:-r.total,date:new Date()}; notifText=`Votre retrait de ${fmt(r.amount)} a été approuvé.`; }
+    if(kind==='Recharge'){
+      const { data:newBal, error } = await sb.rpc('increment_balance', {p_number:acc.number, p_amount:r.amount});
+      if(error){ toast("Échec de l'approbation — réessayez"); return; }
+      acc.balance = Number(newBal);
+      tx={id:genId('HB'),desc:'Recharge '+r.method+' approuvée',cat:'Dépôt',amount:r.amount,date:new Date()};
+      notifText=`Votre recharge de ${fmt(r.amount)} a été approuvée.`;
+    } else {
+      const { data:newBal, error } = await sb.rpc('debit_balance_checked', {p_number:acc.number, p_amount:r.total});
+      if(error){
+        toast('Solde du compte insuffisant, refus automatique');
+        r.status='rejected'; r.resolvedAt=nowIso;
+        await sb.from(table).update({status:'rejected', resolved_at:nowIso}).eq('id',id);
+        renderPage(); return;
+      }
+      acc.balance = Number(newBal);
+      tx={id:genId('HB'),desc:'Retrait approuvé',cat:'Retrait',amount:-r.total,date:new Date()};
+      notifText=`Votre retrait de ${fmt(r.amount)} a été approuvé.`;
+    }
     acc.transactions.unshift(tx);
-    r.status='approved';
+    r.status='approved'; r.resolvedAt=nowIso;
     const notifId = genId('N');
     await Promise.all([
-      sb.from('accounts').update({balance:acc.balance}).eq('number',acc.number),
       sb.from('transactions').insert({id:tx.id, account_number:acc.number, description:tx.desc, category:tx.cat, amount:tx.amount}),
-      sb.from(table).update({status:'approved'}).eq('id',id),
+      sb.from(table).update({status:'approved', resolved_at:nowIso}).eq('id',id),
       sb.from('notifications').insert({id:notifId, account_number:acc.number, text:notifText, read:false}),
     ]);
   } else {
-    r.status='rejected';
+    r.status='rejected'; r.resolvedAt=nowIso;
     const notifId = genId('N');
     const notifText = `Votre demande de ${kind.toLowerCase()} (${fmt(r.amount)}) a été refusée.`;
     await Promise.all([
-      sb.from(table).update({status:'rejected'}).eq('id',id),
+      sb.from(table).update({status:'rejected', resolved_at:nowIso}).eq('id',id),
       sb.from('notifications').insert({id:notifId, account_number:acc.number, text:notifText, read:false}),
     ]);
   }
@@ -1162,8 +1248,9 @@ function drawBarChart(id,labels,data,color){
 function drawCharts(){
   drawLineFlux('fin-chart', state.displaySeries, '#0A1B3D', 'rgba(10,27,61,.15)');
   drawLineFlux('an-fin-chart', state.displaySeries, '#0A1B3D', 'rgba(10,27,61,.15)');
-  drawDoughnutChart('role-chart', [roleCount('eleve'),roleCount('professeur'),roleCount('personnel'),roleCount('parent')], ['#0C2350','#2748A0','#3E5FC4','#8FA6F5']);
-  const cats={}; allAccounts().forEach(a=>a.transactions.filter(t=>t.amount<0).forEach(t=>{cats[t.cat]=(cats[t.cat]||0)+Math.abs(t.amount);}));
+  const rc0 = dashStats.role_counts||{};
+  drawDoughnutChart('role-chart', [rc0.eleve||0,rc0.professeur||0,rc0.personnel||0,rc0.parent||0], ['#0C2350','#2748A0','#3E5FC4','#8FA6F5']);
+  const cats={}; txResults.filter(t=>t.amount<0).forEach(t=>{cats[t.cat]=(cats[t.cat]||0)+Math.abs(t.amount);});
   drawBarChart('an-cat-chart', Object.keys(cats), Object.values(cats), '#0A1B3D');
 }
 function ensureTicker(){
