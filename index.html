@@ -218,6 +218,7 @@ const AV_PALETTE=['#2748A0','#8B5FBF','#1B8F5A','#C4433F','#B8860B','#0C7C8C'];
 function colorFor(n){ let s=0; for(const c of n) s+=c.charCodeAt(0); return AV_PALETTE[s%AV_PALETTE.length]; }
 function roleLabel(r){ return {eleve:'Élève',parent:'Parent',professeur:'Professeur',personnel:'Personnel',direction:'Direction'}[r]||r; }
 
+const CLASSES = ['7e Année Fondamentale','8e Année Fondamentale','9e Année Fondamentale','Secondaire I (NS1)','Secondaire II (NS2)','Secondaire III (NS3)','Secondaire IV — Philo'];
 const ACCOUNTS = {};
 const RECHARGE_REQUESTS = [];
 const WITHDRAW_REQUESTS = [];
