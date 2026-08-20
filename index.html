@@ -906,7 +906,16 @@ async function handleReq(kind,id,approve){
   const list = kind==='Recharge'?RECHARGE_REQUESTS:WITHDRAW_REQUESTS;
   const table = kind==='Recharge' ? 'recharge_requests' : 'withdraw_requests';
   const r = list.find(x=>x.id===id);
-  const acc = ACCOUNTS[r.accountNumber];
+  let acc = ACCOUNTS[r.accountNumber];
+  if(!acc){
+    const { data } = await sb.from('accounts').select('*').eq('number',r.accountNumber).maybeSingle();
+    if(!data){ toast('Compte introuvable — impossible de traiter cette demande'); return; }
+    acc = ACCOUNTS[r.accountNumber] = {
+      number:data.number, nom:data.nom, prenom:data.prenom, role:data.role, classe:data.classe,
+      name:data.prenom+' '+data.nom, balance:Number(data.balance), status:data.status, accountType:data.account_type, password:data.password,
+      cards:[], transactions:[], notifications:[], createdAt:new Date(data.created_at),
+    };
+  }
   if(approve){
     let tx, notifText;
     if(kind==='Recharge'){ acc.balance+=r.amount; tx={id:genId('HB'),desc:'Recharge '+r.method+' approuvée',cat:'Dépôt',amount:r.amount,date:new Date()}; notifText=`Votre recharge de ${fmt(r.amount)} a été approuvée.`; }
